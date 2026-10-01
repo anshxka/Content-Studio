@@ -89,14 +89,16 @@ def call_gemini(prompt):
                 f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
                 params={"key": os.environ["GEMINI_API_KEY"]},
                 json={"contents": [{"parts": [{"text": prompt}]}],
-                      "generationConfig": {"responseMimeType": "application/json", "temperature": 0.8}},
+                      "generationConfig": {"responseMimeType": "application/json", "temperature": 0.7,
+                                           "maxOutputTokens": 16000}},
                 timeout=300)
             if r.status_code == 200:
                 return "".join(p.get("text", "") for p in r.json()["candidates"][0]["content"]["parts"])
             last = f"{model} error {r.status_code}: {r.text[:300]}"
             print(last)
             if r.status_code in (500, 502, 503, 504):
-                time.sleep(20 * (attempt + 1))
+                print(f"Gemini busy - waiting {30 * (attempt + 1)}s...")
+                time.sleep(30 * (attempt + 1))
                 continue
             break
     raise RuntimeError(last)
@@ -132,17 +134,35 @@ def call_claude(prompt):
     return "".join(b.get("text", "") for b in r.json()["content"])
 
 
+def parse_json(text):
+    """Read the AI's JSON answer, repairing common small mistakes (trailing commas, code fences, stray text)."""
+    text = re.sub(r"^```(?:json)?|```$", "", (text or "").strip(), flags=re.M).strip()
+    text = text[text.find("{"): text.rfind("}") + 1]
+    for attempt in (text, re.sub(r",\s*([}\]])", r"\1", text)):
+        try:
+            return json.loads(attempt, strict=False)
+        except json.JSONDecodeError:
+            continue
+    raise ValueError("AI reply was not valid JSON")
+
+
 def ask_ai(prompt):
+    """Uses whichever keys you added, in order: Gemini, Groq, Claude. Retries if the reply is broken."""
     errors = []
     for env, fn in (("GEMINI_API_KEY", call_gemini), ("GROQ_API_KEY", call_groq), ("ANTHROPIC_API_KEY", call_claude)):
         if not os.getenv(env):
             continue
-        try:
-            text = fn(prompt)
-            return json.loads(text[text.find("{"): text.rfind("}") + 1])
-        except Exception as e:
-            print(f"{fn.__name__} failed, trying next: {e}")
-            errors.append(str(e))
+        for attempt in range(3):
+            try:
+                return parse_json(fn(prompt))
+            except ValueError as e:
+                print(f"{fn.__name__}: broken reply (attempt {attempt + 1}/3), asking again...")
+                errors.append(str(e))
+                time.sleep(10)
+            except Exception as e:
+                print(f"{fn.__name__} failed, trying next: {e}")
+                errors.append(str(e))
+                break
     raise SystemExit("All AI providers failed:\n" + "\n".join(errors or ["No API key found - add GEMINI_API_KEY"]))
 
 
